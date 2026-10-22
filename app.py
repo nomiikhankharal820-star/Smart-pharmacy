@@ -50,6 +50,21 @@ def execute(sql, params=()):
         c.close()
 
 
+def column_exists(c, table, col):
+    return any(r["name"] == col for r in c.execute(f"PRAGMA table_info({table})").fetchall())
+
+
+def migrate(c):
+    """Upgrade an older smart_pharmacy.db (made before profit tracking) without losing data."""
+    if not column_exists(c, "medicines", "cost_price"):
+        c.execute("ALTER TABLE medicines ADD COLUMN cost_price REAL NOT NULL DEFAULT 0")
+    if not column_exists(c, "order_items", "unit_cost"):
+        c.execute("ALTER TABLE order_items ADD COLUMN unit_cost REAL NOT NULL DEFAULT 0")
+        c.execute("UPDATE order_items SET unit_cost = "
+                  "(SELECT cost_price FROM medicines WHERE medicines.id = order_items.medicine_id)")
+    c.commit()
+
+
 def init_db():
     c = get_conn()
     c.executescript("""
@@ -60,6 +75,7 @@ def init_db():
         form TEXT,                      -- Tablet, Capsule, Syrup, Injection ...
         requires_rx INTEGER DEFAULT 0,  -- 1 = prescription only (all injections)
         price REAL NOT NULL,
+        cost_price REAL NOT NULL DEFAULT 0,   -- what the pharmacy paid per unit (needed for profit)
         stock INTEGER NOT NULL DEFAULT 0,
         batch_no TEXT,
         expiry TEXT NOT NULL,           -- YYYY-MM-DD
@@ -90,7 +106,8 @@ def init_db():
         medicine_id INTEGER NOT NULL REFERENCES medicines(id),
         batch_no TEXT,
         quantity INTEGER NOT NULL,
-        unit_price REAL NOT NULL
+        unit_price REAL NOT NULL,
+        unit_cost REAL NOT NULL DEFAULT 0     -- cost at the time of sale, so old profit never changes
     );
     CREATE TABLE IF NOT EXISTS payments(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,22 +127,24 @@ def init_db():
     );
     """)
     c.commit()
+    migrate(c)
     if c.execute("SELECT COUNT(*) FROM medicines").fetchone()[0] == 0:
         today = dt.date.today()
         d = lambda n: (today + dt.timedelta(days=n)).isoformat()
         sample = [
-            ("Paracetamol", "500mg", "Tablet", 0, 3.0, 400, "PCM-101", d(400), 100),
-            ("ORS", "20.5g", "Sachet", 0, 35.0, 120, "ORS-220", d(300), 30),
-            ("Cetirizine", "10mg", "Tablet", 0, 6.0, 15, "CTZ-310", d(250), 40),
-            ("Amoxicillin", "500mg", "Capsule", 1, 25.0, 200, "AMX-415", d(200), 50),
-            ("Ceftriaxone", "1g", "Injection", 1, 280.0, 60, "CEF-512", d(180), 20),
-            ("Diclofenac", "75mg", "Injection", 1, 60.0, 80, "DIC-618", d(25), 20),
-            ("Vitamin B12", "1000mcg", "Injection", 1, 90.0, 40, "B12-720", d(365), 15),
-            ("Old Cough Syrup", "100ml", "Syrup", 0, 150.0, 10, "CGH-001", d(-5), 10),  # expired on purpose
+            # name, strength, form, rx, sale price, cost price, stock, batch, expiry, reorder level
+            ("Paracetamol", "500mg", "Tablet", 0, 3.0, 2.0, 400, "PCM-101", d(400), 100),
+            ("ORS", "20.5g", "Sachet", 0, 35.0, 25.0, 120, "ORS-220", d(300), 30),
+            ("Cetirizine", "10mg", "Tablet", 0, 6.0, 4.0, 15, "CTZ-310", d(250), 40),
+            ("Amoxicillin", "500mg", "Capsule", 1, 25.0, 18.0, 200, "AMX-415", d(200), 50),
+            ("Ceftriaxone", "1g", "Injection", 1, 280.0, 210.0, 60, "CEF-512", d(180), 20),
+            ("Diclofenac", "75mg", "Injection", 1, 60.0, 42.0, 80, "DIC-618", d(25), 20),
+            ("Vitamin B12", "1000mcg", "Injection", 1, 90.0, 65.0, 40, "B12-720", d(365), 15),
+            ("Old Cough Syrup", "100ml", "Syrup", 0, 150.0, 100.0, 10, "CGH-001", d(-5), 10),  # expired on purpose
         ]
         c.executemany(
-            "INSERT INTO medicines(name,strength,form,requires_rx,price,stock,batch_no,expiry,reorder_level) "
-            "VALUES(?,?,?,?,?,?,?,?,?)", sample)
+            "INSERT INTO medicines(name,strength,form,requires_rx,price,cost_price,stock,batch_no,expiry,reorder_level) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)", sample)
         c.execute("INSERT INTO customers(name,phone,email,address) VALUES('Walk-in Customer','','','')")
         c.commit()
     c.close()
@@ -160,13 +179,13 @@ def create_order(customer_id, cart, source="counter", note=""):
             return None, f"Not enough stock for {m['name']} (available {m['stock']})."
         needs_rx = needs_rx or bool(m["requires_rx"])
         total += m["price"] * item["qty"]
-        rows.append((m["id"], m["batch_no"], item["qty"], m["price"]))
+        rows.append((m["id"], m["batch_no"], item["qty"], m["price"], m["cost_price"]))
     status = "pending_approval" if needs_rx else "awaiting_payment"
     oid = execute(
         "INSERT INTO orders(customer_id,source,status,payment_status,total,note,created_at) VALUES(?,?,?,?,?,?,?)",
         (customer_id, source, status, "unpaid", total, note, now()))
     for r in rows:
-        execute("INSERT INTO order_items(order_id,medicine_id,batch_no,quantity,unit_price) VALUES(?,?,?,?,?)",
+        execute("INSERT INTO order_items(order_id,medicine_id,batch_no,quantity,unit_price,unit_cost) VALUES(?,?,?,?,?,?)",
                 (oid, *r))
     log("system", "order_created", f"order #{oid}, status={status}")
     msg = ("Order needs pharmacist approval (injection / prescription medicine)."
@@ -251,6 +270,65 @@ def start_online_payment(order, method):
     raise NotImplementedError("Real payment gateway is not connected yet. See the docstring above.")
 
 
+def get_report(start, end):
+    """Sales, profit and stock left for confirmed orders between two dates (YYYY-MM-DD, inclusive)."""
+    per_med = query(
+        "SELECT m.id, m.name, m.strength, m.form, m.cost_price, m.stock AS stock_left, m.expiry, m.reorder_level, "
+        "COALESCE(SUM(oi.quantity),0) AS units_sold, "
+        "COALESCE(SUM(oi.quantity*oi.unit_price),0) AS sales, "
+        "COALESCE(SUM(oi.quantity*(oi.unit_price-oi.unit_cost)),0) AS profit "
+        "FROM medicines m LEFT JOIN ("
+        "   SELECT x.* FROM order_items x JOIN orders o ON o.id=x.order_id "
+        "   WHERE o.status='confirmed' AND date(o.created_at) BETWEEN ? AND ?"
+        ") oi ON oi.medicine_id=m.id "
+        "GROUP BY m.id ORDER BY sales DESC, m.name", (start, end))
+    daily = query(
+        "SELECT date(o.created_at) AS day, SUM(x.quantity*x.unit_price) AS sales, "
+        "SUM(x.quantity*(x.unit_price-x.unit_cost)) AS profit "
+        "FROM order_items x JOIN orders o ON o.id=x.order_id "
+        "WHERE o.status='confirmed' AND date(o.created_at) BETWEEN ? AND ? GROUP BY day ORDER BY day", (start, end))
+    pay = query(
+        "SELECT payment_status, COUNT(*) AS n, SUM(total) AS amount FROM orders "
+        "WHERE status='confirmed' AND date(created_at) BETWEEN ? AND ? GROUP BY payment_status", (start, end))
+    sales = sum(r["sales"] for r in per_med)
+    profit = sum(r["profit"] for r in per_med)
+    totals = {
+        "sales": sales,
+        "profit": profit,
+        "cost": sales - profit,
+        "margin": (profit / sales * 100) if sales else 0.0,
+        "units_sold": sum(r["units_sold"] for r in per_med),
+        "orders": sum(r["n"] for r in pay),
+        "received": sum(r["amount"] for r in pay if r["payment_status"] == "paid"),
+        "cod_pending": sum(r["amount"] for r in pay if r["payment_status"] == "cod_pending"),
+    }
+    return {"per_med": per_med, "daily": daily, "totals": totals}
+
+
+def get_stock_summary():
+    """Current stock left (not limited by date)."""
+    today = dt.date.today().isoformat()
+    meds = query("SELECT * FROM medicines")
+    return {
+        "units_left": sum(m["stock"] for m in meds),
+        "stock_value": sum(m["stock"] * m["cost_price"] for m in meds),
+        "out_of_stock": sum(1 for m in meds if m["stock"] == 0),
+        "low_stock": sum(1 for m in meds if 0 < m["stock"] <= m["reorder_level"]),
+        "expired_units": sum(m["stock"] for m in meds if m["expiry"] < today),
+        "missing_cost": sum(1 for m in meds if m["cost_price"] <= 0),
+    }
+
+
+def stock_status(m):
+    if m["expiry"] < dt.date.today().isoformat():
+        return "EXPIRED"
+    if m["stock_left"] == 0:
+        return "OUT OF STOCK"
+    if m["stock_left"] <= m["reorder_level"]:
+        return "LOW STOCK"
+    return "OK"
+
+
 def invoice_text(order_id):
     o = query("SELECT o.*, c.name AS cname, c.phone FROM orders o JOIN customers c ON c.id=o.customer_id "
               "WHERE o.id=?", (order_id,))[0]
@@ -275,17 +353,18 @@ def invoice_text(order_id):
 def page_dashboard():
     st.header("Dashboard")
     today = dt.date.today().isoformat()
-    sales = query("SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE payment_status='paid' "
-                  "AND date(created_at)=?", (today,))[0]["s"]
+    rep = get_report(today, today)["totals"]
     pending = query("SELECT COUNT(*) AS n FROM orders WHERE status='pending_approval'")[0]["n"]
     low = query("SELECT * FROM medicines WHERE stock <= reorder_level ORDER BY stock")
     soon = (dt.date.today() + dt.timedelta(days=90)).isoformat()
     expiring = query("SELECT * FROM medicines WHERE expiry <= ? ORDER BY expiry", (soon,))
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Today's paid sales (PKR)", f"{sales:,.0f}")
-    c2.metric("Waiting for approval", pending)
-    c3.metric("Low stock items", len(low))
-    c4.metric("Expiring within 90 days", len(expiring))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Today's sales (PKR)", f"{rep['sales']:,.0f}")
+    c2.metric("Today's profit (PKR)", f"{rep['profit']:,.0f}")
+    c3.metric("Waiting for approval", pending)
+    c4.metric("Low stock items", len(low))
+    c5.metric("Expiring within 90 days", len(expiring))
+    st.caption("Open the Reports page for full sales, profit and stock-left details.")
     st.subheader("Low stock")
     st.dataframe(pd.DataFrame(low)[["name", "strength", "form", "stock", "reorder_level"]]
                  if low else pd.DataFrame(), use_container_width=True)
@@ -309,8 +388,9 @@ def page_medicines():
     df["prescription_only"] = df["requires_rx"].map({1: "Yes", 0: "No"})
     df["status"] = df.apply(lambda r: "EXPIRED" if is_expired(r["expiry"])
                             else ("LOW STOCK" if r["stock"] <= r["reorder_level"] else "OK"), axis=1)
-    st.dataframe(df[["id", "name", "strength", "form", "prescription_only", "price", "stock",
-                     "batch_no", "expiry", "status"]], use_container_width=True)
+    df["profit_per_unit"] = df["price"] - df["cost_price"]
+    st.dataframe(df[["id", "name", "strength", "form", "prescription_only", "cost_price", "price",
+                     "profit_per_unit", "stock", "batch_no", "expiry", "status"]], use_container_width=True)
 
     with st.expander("Add a new medicine / injection"):
         with st.form("add_med"):
@@ -319,11 +399,12 @@ def page_medicines():
             strength = col[0].text_input("Strength (e.g. 500mg)")
             form = col[1].selectbox("Form", ["Tablet", "Capsule", "Syrup", "Injection", "Drip", "Sachet", "Other"])
             rx = col[2].checkbox("Prescription only", value=False)
-            col2 = st.columns(4)
-            price = col2[0].number_input("Sale price (PKR)", min_value=0.0, step=1.0)
-            stock = col2[1].number_input("Stock", min_value=0, step=1)
-            batch = col2[2].text_input("Batch no")
-            expiry = col2[3].date_input("Expiry date", dt.date.today() + dt.timedelta(days=365))
+            col2 = st.columns(5)
+            cost = col2[0].number_input("Cost price (PKR)", min_value=0.0, step=1.0)
+            price = col2[1].number_input("Sale price (PKR)", min_value=0.0, step=1.0)
+            stock = col2[2].number_input("Stock", min_value=0, step=1)
+            batch = col2[3].text_input("Batch no")
+            expiry = col2[4].date_input("Expiry date", dt.date.today() + dt.timedelta(days=365))
             reorder = st.number_input("Reorder level", min_value=0, value=20)
             if st.form_submit_button("Save medicine"):
                 if not name.strip() or price <= 0:
@@ -331,9 +412,10 @@ def page_medicines():
                 else:
                     # Every injection is prescription-only in this system.
                     rx_flag = 1 if (rx or form == "Injection") else 0
-                    execute("INSERT INTO medicines(name,strength,form,requires_rx,price,stock,batch_no,expiry,reorder_level) "
-                            "VALUES(?,?,?,?,?,?,?,?,?)",
-                            (name.strip(), strength, form, rx_flag, price, int(stock), batch, expiry.isoformat(), reorder))
+                    execute("INSERT INTO medicines(name,strength,form,requires_rx,price,cost_price,stock,batch_no,expiry,reorder_level) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (name.strip(), strength, form, rx_flag, price, cost, int(stock), batch,
+                             expiry.isoformat(), reorder))
                     log("admin", "medicine_added", name.strip())
                     st.success("Saved.")
                     st.rerun()
@@ -348,6 +430,28 @@ def page_medicines():
                 log("admin", "restock", f"{pick} +{int(qty)}")
                 st.success("Stock updated.")
                 st.rerun()
+
+    page_update_prices(meds)
+
+
+def page_update_prices(meds):
+    with st.expander("Update sale price / cost price"):
+        st.caption("Old sales keep the cost they were sold at, so past profit never changes.")
+        with st.form("upd_price"):
+            names = {f"{m['name']} {m['strength']} ({m['form']})": m for m in meds}
+            pick = st.selectbox("Medicine", list(names))
+            cur = names[pick]
+            col = st.columns(2)
+            new_cost = col[0].number_input("New cost price (PKR)", min_value=0.0, value=float(cur["cost_price"]), step=1.0)
+            new_price = col[1].number_input("New sale price (PKR)", min_value=0.0, value=float(cur["price"]), step=1.0)
+            if st.form_submit_button("Save prices"):
+                if new_price <= 0:
+                    st.error("Sale price must be above 0.")
+                else:
+                    execute("UPDATE medicines SET cost_price=?, price=? WHERE id=?", (new_cost, new_price, cur["id"]))
+                    log("admin", "price_updated", f"{pick}: cost {new_cost}, price {new_price}")
+                    st.success("Prices updated.")
+                    st.rerun()
 
 
 def page_new_order():
@@ -484,6 +588,72 @@ def page_orders():
         st.download_button("Download invoice (.txt)", text, file_name=f"invoice_{inv:05d}.txt")
 
 
+def page_reports():
+    st.header("Sales, profit and stock report")
+    today = dt.date.today()
+    period = st.radio("Period", ["Today", "Last 7 days", "Last 30 days", "All time", "Custom dates"], horizontal=True)
+    if period == "Today":
+        start, end = today, today
+    elif period == "Last 7 days":
+        start, end = today - dt.timedelta(days=6), today
+    elif period == "Last 30 days":
+        start, end = today - dt.timedelta(days=29), today
+    elif period == "All time":
+        start, end = dt.date(2000, 1, 1), today
+    else:
+        a, b = st.columns(2)
+        start = a.date_input("From", today - dt.timedelta(days=30))
+        end = b.date_input("To", today)
+        if start > end:
+            st.error("The 'From' date must be before the 'To' date.")
+            return
+
+    rep = get_report(start.isoformat(), end.isoformat())
+    t = rep["totals"]
+    stock = get_stock_summary()
+
+    st.subheader("Sales and profit")
+    c = st.columns(4)
+    c[0].metric("Total sales (PKR)", f"{t['sales']:,.0f}")
+    c[1].metric("Total profit (PKR)", f"{t['profit']:,.0f}")
+    c[2].metric("Profit margin", f"{t['margin']:.1f}%")
+    c[3].metric("Items sold (units)", f"{t['units_sold']:,}")
+    c = st.columns(4)
+    c[0].metric("Confirmed orders", t["orders"])
+    c[1].metric("Cost of goods sold (PKR)", f"{t['cost']:,.0f}")
+    c[2].metric("Money received (PKR)", f"{t['received']:,.0f}")
+    c[3].metric("COD cash still to collect (PKR)", f"{t['cod_pending']:,.0f}")
+
+    st.subheader("Items left in stock (right now)")
+    c = st.columns(4)
+    c[0].metric("Total units left", f"{stock['units_left']:,}")
+    c[1].metric("Stock value at cost (PKR)", f"{stock['stock_value']:,.0f}")
+    c[2].metric("Low / out of stock", f"{stock['low_stock']} / {stock['out_of_stock']}")
+    c[3].metric("Expired units", f"{stock['expired_units']:,}")
+    if stock["missing_cost"]:
+        st.warning(f"{stock['missing_cost']} medicine(s) have cost price 0, so their profit looks too high. "
+                   "Set the real cost in Medicines > Update sale price / cost price.")
+
+    st.subheader("Medicine-wise report")
+    if rep["per_med"]:
+        table = pd.DataFrame([{
+            "Medicine": f"{m['name']} {m['strength']} ({m['form']})",
+            "Units sold": m["units_sold"],
+            "Sales (PKR)": round(m["sales"], 2),
+            "Profit (PKR)": round(m["profit"], 2),
+            "Stock left": m["stock_left"],
+            "Status": stock_status(m),
+        } for m in rep["per_med"]])
+        st.dataframe(table, use_container_width=True)
+        st.download_button("Download this report (.csv)", table.to_csv(index=False),
+                           file_name=f"pharmacy_report_{start}_{end}.csv")
+    if rep["daily"]:
+        st.subheader("Day-by-day sales and profit")
+        st.bar_chart(pd.DataFrame(rep["daily"]).set_index("day")[["sales", "profit"]])
+    elif t["orders"] == 0:
+        st.info("No confirmed sales in this period yet.")
+
+
 def page_audit():
     st.header("Audit log")
     rows = query("SELECT created_at, user, action, target FROM audit_log ORDER BY id DESC LIMIT 200")
@@ -496,11 +666,11 @@ def main():
     st.sidebar.title("Smart Pharmacy")
     if DEMO_MODE:
         st.sidebar.info("Payments are in DEMO MODE.")
-    page = st.sidebar.radio("Menu", ["Dashboard", "Medicines", "New order", "Approval queue",
+    page = st.sidebar.radio("Menu", ["Dashboard", "Reports", "Medicines", "New order", "Approval queue",
                                      "Orders and payments", "Audit log"])
-    {"Dashboard": page_dashboard, "Medicines": page_medicines, "New order": page_new_order,
-     "Approval queue": page_approvals, "Orders and payments": page_orders,
-     "Audit log": page_audit}[page]()
+    {"Dashboard": page_dashboard, "Reports": page_reports, "Medicines": page_medicines,
+     "New order": page_new_order, "Approval queue": page_approvals,
+     "Orders and payments": page_orders, "Audit log": page_audit}[page]()
 
 
 if __name__ == "__main__":
